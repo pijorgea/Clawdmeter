@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "author": "Clawdmeter",
+  "editor": "wokwi",
+  "parts": [
+    {
+      "type": "board:esp32-devkit-v1",
+      "id": "esp",
+      "top": 0,
+      "left": 0,
+      "attrs": {}
+    },
+    {
+      "type": "wokwi-ili9341",
+      "id": "lcd",
+      "top": -76,
+      "left": 400,
+      "attrs": { "rotation": "90" }
+    }
+  ],
+  "connections": [
+    [ "esp:GND.2",  "lcd:GND",  "black",  [] ],
+    [ "esp:3V3",    "lcd:VCC",  "red",    [] ],
+    [ "esp:D14",    "lcd:CLK",  "orange", [] ],
+    [ "esp:D13",    "lcd:MOSI", "blue",   [] ],
+    [ "esp:D12",    "lcd:MISO", "yellow", [] ],
+    [ "esp:D15",    "lcd:CS",   "purple", [] ],
+    [ "esp:D2",     "lcd:DC",   "green",  [] ]
+  ],
+  "serialMonitor": {
+    "display": "auto"
+  }
+}

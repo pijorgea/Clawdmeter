@@ -26,48 +26,92 @@ LV_FONT_DECLARE(font_mono_32);
 #define COL_RED       THEME_RED
 #define COL_BAR_BG    THEME_BAR_BG
 
+LV_FONT_DECLARE(font_styrene_12);
+
 struct Layout {
     int16_t scr_w, scr_h;
     int16_t margin;
     int16_t title_y;
+    int16_t wifi_y;
     int16_t content_y;
     int16_t content_w;
     int16_t usage_panel_h;
     int16_t usage_panel_gap;
     int16_t usage_bar_y;
+    int16_t usage_bar_h;
     int16_t usage_reset_y;
     const lv_font_t* title_font;
+    const lv_font_t* pct_font;
+    const lv_font_t* pill_font;
+    const lv_font_t* reset_font;
     const lv_font_t* field_font;
     const lv_font_t* small_font;
+    bool show_chrome;   // logo + battery visible
 };
 static Layout L = {};
 
 static void compute_layout(const BoardCaps& c) {
     L.scr_w = c.width;
     L.scr_h = c.height;
-    L.margin = 20;
-    L.title_y = 30;
     L.content_w = L.scr_w - 2 * L.margin;
 
     if (c.height >= 460) {
-        L.content_y      = 100;
-        L.usage_panel_h  = 150;
+        // Large — 480x480 (AMOLED-2.16)
+        L.margin          = 20;
+        L.title_y         = 30;
+        L.wifi_y          = 76;
+        L.content_y       = 100;
+        L.usage_panel_h   = 150;
         L.usage_panel_gap = 16;
-        L.usage_bar_y    = 56;
-        L.usage_reset_y  = 94;
-        L.title_font     = &font_tiempos_56;
-        L.field_font     = &font_styrene_28;
-        L.small_font     = &font_styrene_20;
-    } else {
-        L.content_y      = 85;
-        L.usage_panel_h  = 130;
+        L.usage_bar_y     = 56;
+        L.usage_bar_h     = 24;
+        L.usage_reset_y   = 94;
+        L.title_font      = &font_tiempos_56;
+        L.pct_font        = &font_styrene_48;
+        L.pill_font       = &font_styrene_28;
+        L.reset_font      = &font_styrene_28;
+        L.field_font      = &font_styrene_28;
+        L.small_font      = &font_styrene_20;
+        L.show_chrome     = true;
+    } else if (c.height >= 300) {
+        // Compact — 368x448 (AMOLED-1.8)
+        L.margin          = 20;
+        L.title_y         = 30;
+        L.wifi_y          = 68;
+        L.content_y       = 85;
+        L.usage_panel_h   = 130;
         L.usage_panel_gap = 12;
-        L.usage_bar_y    = 48;
-        L.usage_reset_y  = 78;
-        L.title_font     = &font_tiempos_34;
-        L.field_font     = &font_styrene_20;
-        L.small_font     = &font_styrene_16;
+        L.usage_bar_y     = 48;
+        L.usage_bar_h     = 20;
+        L.usage_reset_y   = 78;
+        L.title_font      = &font_tiempos_34;
+        L.pct_font        = &font_styrene_48;
+        L.pill_font       = &font_styrene_20;
+        L.reset_font      = &font_styrene_20;
+        L.field_font      = &font_styrene_20;
+        L.small_font      = &font_styrene_16;
+        L.show_chrome     = true;
+    } else {
+        // Micro — 320x240 landscape (CYD ESP32-2432S028R)
+        L.margin          = 8;
+        L.title_y         = 6;
+        L.wifi_y          = 44;
+        L.content_y       = 60;
+        L.usage_panel_h   = 76;
+        L.usage_panel_gap = 6;
+        L.usage_bar_y     = 30;
+        L.usage_bar_h     = 14;
+        L.usage_reset_y   = 54;
+        L.title_font      = &font_tiempos_34;
+        L.pct_font        = &font_styrene_28;
+        L.pill_font       = &font_styrene_14;
+        L.reset_font      = &font_styrene_12;
+        L.field_font      = &font_styrene_16;
+        L.small_font      = &font_styrene_12;
+        L.show_chrome     = false;  // no room for logo/battery on 320x240
     }
+
+    L.content_w = L.scr_w - 2 * L.margin;
 }
 
 // ---- Usage screen ----
@@ -214,20 +258,6 @@ static void init_icon_dsc_rgb565a8(lv_image_dsc_t* dsc, int w, int h, const uint
     dsc->data_size = w * h * 3;
 }
 
-static lv_obj_t* make_pill(lv_obj_t* parent, const char* text) {
-    lv_obj_t* lbl = lv_label_create(parent);
-    lv_label_set_text(lbl, text);
-    lv_obj_set_style_text_font(lbl, &font_styrene_28, 0);
-    lv_obj_set_style_text_color(lbl, COL_TEXT, 0);
-    lv_obj_set_style_bg_color(lbl, COL_BAR_BG, 0);
-    lv_obj_set_style_bg_opa(lbl, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(lbl, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_pad_left(lbl, 18, 0);
-    lv_obj_set_style_pad_right(lbl, 18, 0);
-    lv_obj_set_style_pad_top(lbl, 6, 0);
-    lv_obj_set_style_pad_bottom(lbl, 6, 0);
-    return lbl;
-}
 
 static void init_battery_icons(void) {
     init_icon_dsc_rgb565a8(&battery_dscs[0], ICON_BATTERY_W, ICON_BATTERY_H, icon_battery_data);
@@ -246,18 +276,26 @@ static void make_usage_panel(lv_obj_t* parent, int y, const char* pill_text,
 
     *out_pct = lv_label_create(panel);
     lv_label_set_text(*out_pct, "---%");
-    lv_obj_set_style_text_font(*out_pct, &font_styrene_48, 0);
+    lv_obj_set_style_text_font(*out_pct, L.pct_font, 0);
     lv_obj_set_style_text_color(*out_pct, COL_TEXT, 0);
     lv_obj_set_pos(*out_pct, 0, 0);
 
-    *out_pill = make_pill(panel, pill_text);
+    *out_pill = lv_label_create(panel);
+    lv_label_set_text(*out_pill, pill_text);
+    lv_obj_set_style_text_font(*out_pill, L.pill_font, 0);
+    lv_obj_set_style_text_color(*out_pill, COL_TEXT, 0);
+    lv_obj_set_style_bg_color(*out_pill, COL_BAR_BG, 0);
+    lv_obj_set_style_bg_opa(*out_pill, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(*out_pill, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_pad_hor(*out_pill, 10, 0);
+    lv_obj_set_style_pad_ver(*out_pill, 4, 0);
     lv_obj_align(*out_pill, LV_ALIGN_TOP_RIGHT, 0, 1);
 
-    *out_bar = make_bar(panel, 0, L.usage_bar_y, L.content_w - 32, 24);
+    *out_bar = make_bar(panel, 0, L.usage_bar_y, L.content_w - 32, L.usage_bar_h);
 
     *out_reset = lv_label_create(panel);
     lv_label_set_text(*out_reset, "---");
-    lv_obj_set_style_text_font(*out_reset, &font_styrene_28, 0);
+    lv_obj_set_style_text_font(*out_reset, L.reset_font, 0);
     lv_obj_set_style_text_color(*out_reset, COL_DIM, 0);
     lv_obj_set_pos(*out_reset, 0, L.usage_reset_y);
 }
@@ -282,7 +320,7 @@ static void init_usage_screen(lv_obj_t* scr) {
     lv_label_set_text(lbl_wifi_status, "WiFi: connecting...");
     lv_obj_set_style_text_font(lbl_wifi_status, L.small_font, 0);
     lv_obj_set_style_text_color(lbl_wifi_status, COL_DIM, 0);
-    lv_obj_align(lbl_wifi_status, LV_ALIGN_TOP_MID, 16, L.title_y + 50);
+    lv_obj_align(lbl_wifi_status, LV_ALIGN_TOP_MID, 16, L.wifi_y);
 
     make_usage_panel(usage_container, L.content_y, "Current",
                      &lbl_session_pct, &lbl_session_label,
@@ -342,8 +380,8 @@ static lv_obj_t* make_field(lv_obj_t* parent, const char* label_text,
     lv_obj_set_style_text_color(ta, COL_TEXT, 0);
     lv_obj_set_style_bg_color(ta, COL_PANEL, 0);
     lv_obj_set_style_bg_opa(ta, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_color(ta, COL_ACCENT, LV_PART_MAIN | LV_STATE_FOCUSED);
-    lv_obj_set_style_border_width(ta, 2, LV_PART_MAIN | LV_STATE_FOCUSED);
+    lv_obj_set_style_border_color(ta, COL_ACCENT, (lv_style_selector_t)(LV_PART_MAIN | LV_STATE_FOCUSED));
+    lv_obj_set_style_border_width(ta, 2, (lv_style_selector_t)(LV_PART_MAIN | LV_STATE_FOCUSED));
     lv_obj_set_style_border_width(ta, 1, LV_PART_MAIN);
     lv_obj_set_style_border_color(ta, COL_BAR_BG, LV_PART_MAIN);
     lv_obj_add_event_cb(ta, ta_focus_cb, LV_EVENT_FOCUSED, NULL);
@@ -481,15 +519,16 @@ void ui_tick_anim(void) {
 }
 
 static void apply_chrome_visibility(void) {
-    bool show_chrome = (current_screen != SCREEN_SPLASH &&
-                        current_screen != SCREEN_SETTINGS);
+    bool show = L.show_chrome &&
+                current_screen != SCREEN_SPLASH &&
+                current_screen != SCREEN_SETTINGS;
     if (logo_img) {
-        if (show_chrome) lv_obj_clear_flag(logo_img, LV_OBJ_FLAG_HIDDEN);
-        else             lv_obj_add_flag(logo_img, LV_OBJ_FLAG_HIDDEN);
+        if (show) lv_obj_clear_flag(logo_img, LV_OBJ_FLAG_HIDDEN);
+        else      lv_obj_add_flag(logo_img, LV_OBJ_FLAG_HIDDEN);
     }
     if (battery_img) {
-        if (show_chrome) lv_obj_clear_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
-        else             lv_obj_add_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
+        if (show) lv_obj_clear_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
+        else      lv_obj_add_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
     }
 }
 
