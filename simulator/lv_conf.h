@@ -71,7 +71,7 @@
 #define LV_USE_IMAGE     1
 #define LV_USE_IMG       1
 #define LV_USE_IMGBTN    0
-#define LV_USE_KEYBOARD  0
+#define LV_USE_KEYBOARD  1
 #define LV_USE_LABEL     1
 #define LV_USE_LED       0
 #define LV_USE_LINE      1
@@ -87,7 +87,7 @@
 #define LV_USE_SWITCH    0
 #define LV_USE_TABLE     0
 #define LV_USE_TABVIEW   0
-#define LV_USE_TEXTAREA  0
+#define LV_USE_TEXTAREA  1
 #define LV_USE_TILEVIEW  0
 #define LV_USE_WIN       0
 

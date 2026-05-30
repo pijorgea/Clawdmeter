@@ -1,13 +1,13 @@
 #include <Arduino.h>
-#include <Wire.h>
 #include <lvgl.h>
-#include <ArduinoJson.h>
+#include <time.h>
 #include <esp_heap_caps.h>
 
 #include "data.h"
 #include "ui.h"
-#include "ble.h"
 #include "splash.h"
+#include "settings.h"
+#include "api_client.h"
 #include "usage_rate.h"
 #include "idle.h"
 #include "idle_cfg.h"
@@ -18,13 +18,10 @@
 #include "hal/input_hal.h"
 #include "hal/power_hal.h"
 #include "hal/imu_hal.h"
+#include "hal/wifi_hal.h"
 
 static UsageData usage = {};
 
-// ---- LVGL draw buffers (partial render mode) ----
-// PSRAM-equipped boards (S3) can comfortably hold larger strips. PSRAM-free
-// boards (e.g. ESP32-C6) allocate from internal SRAM, so we shrink the strip
-// — 480×20 RGB565 = 19 KB × 2 buffers = 38 KB, fits beside everything else.
 #ifdef BOARD_HAS_PSRAM
 #define BUF_LINES 40
 #define LV_BUF_CAPS (MALLOC_CAP_SPIRAM)
@@ -49,43 +46,10 @@ static void rounder_cb(lv_event_t* e) {
     display_hal_round_area(&area->x1, &area->y1, &area->x2, &area->y2);
 }
 
-// Touch policy is driven by IDLE_WAKE_ON_TOUCH:
-//   true  → a press edge while asleep wakes the device and the first touch is
-//           swallowed (mirrors the button wake-consumption); a press while
-//           awake counts as activity.
-//   false → touch never counts as activity and is fully swallowed while the
-//           panel is dark, so pets/sleeves can't wake it overnight and LVGL
-//           can't quietly toggle splash<->usage on a black panel.
 static void my_touch_cb(lv_indev_t* indev, lv_indev_data_t* data) {
     uint16_t x, y;
     bool pressed;
     touch_hal_read(&x, &y, &pressed);
-    const bool raw_pressed = pressed;
-
-    if (IDLE_WAKE_ON_TOUCH) {
-        static bool touch_was = false;
-        static bool touch_wake_swallowed = false;
-        if (raw_pressed && !touch_was) {
-            // Press edge — consume as wake if asleep.
-            if (idle_consume_wake_press()) {
-                touch_wake_swallowed = true;
-                pressed = false;
-            }
-        } else if (!raw_pressed && touch_was) {
-            // Release edge.
-            if (touch_wake_swallowed) {
-                touch_wake_swallowed = false;
-                pressed = false;
-            }
-        } else if (raw_pressed && touch_wake_swallowed) {
-            // Held finger through wake — keep hiding until release.
-            pressed = false;
-        }
-        touch_was = raw_pressed;
-    } else if (idle_is_asleep()) {
-        pressed = false;
-    }
-
     if (pressed) {
         data->point.x = x;
         data->point.y = y;
@@ -95,57 +59,33 @@ static void my_touch_cb(lv_indev_t* indev, lv_indev_data_t* data) {
     }
 }
 
-// Parse a JSON line into UsageData.
-static bool parse_json(const char* json, UsageData* out) {
-    JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, json);
-    if (err) {
-        Serial.printf("JSON parse error: %s\n", err.c_str());
-        return false;
-    }
-
-    out->session_pct = doc["s"] | 0.0f;
-    out->session_reset_mins = doc["sr"] | -1;
-    out->weekly_pct = doc["w"] | 0.0f;
-    out->weekly_reset_mins = doc["wr"] | -1;
-    strlcpy(out->status, doc["st"] | "unknown", sizeof(out->status));
-    out->ok = doc["ok"] | false;
-    out->valid = true;
-    return true;
-}
+extern "C" void board_init(void);
 
 // ---- Serial command buffer ----
 #define CMD_BUF_SIZE 64
 static char cmd_buf[CMD_BUF_SIZE];
-static int cmd_pos = 0;
+static int  cmd_pos = 0;
 
 static void send_screenshot() {
 #ifndef BOARD_HAS_PSRAM
-    // A full RGB565 framebuffer doesn't fit in internal SRAM on PSRAM-free
-    // boards (e.g. 480×480×2 = 460 KB). Capture is unsupported there.
     Serial.println("SCREENSHOT_UNSUPPORTED");
     return;
 #else
     const uint32_t w = board_caps().width;
     const uint32_t h = board_caps().height;
     const uint32_t row_bytes = w * 2;
-    const uint32_t buf_size = row_bytes * h;
+    const uint32_t buf_size  = row_bytes * h;
     uint8_t* sbuf = (uint8_t*)heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM);
-    if (!sbuf) {
-        Serial.println("SCREENSHOT_ERR");
-        return;
-    }
+    if (!sbuf) { Serial.println("SCREENSHOT_ERR"); return; }
 
     lv_draw_buf_t draw_buf;
     lv_draw_buf_init(&draw_buf, w, h, LV_COLOR_FORMAT_RGB565, row_bytes, sbuf, buf_size);
-
-    lv_result_t res = lv_snapshot_take_to_draw_buf(lv_screen_active(), LV_COLOR_FORMAT_RGB565, &draw_buf);
-    if (res != LV_RESULT_OK) {
+    if (lv_snapshot_take_to_draw_buf(lv_screen_active(), LV_COLOR_FORMAT_RGB565, &draw_buf)
+            != LV_RESULT_OK) {
         heap_caps_free(sbuf);
         Serial.println("SCREENSHOT_ERR");
         return;
     }
-
     Serial.printf("SCREENSHOT_START %lu %lu %lu\n",
         (unsigned long)w, (unsigned long)h, (unsigned long)buf_size);
     Serial.flush();
@@ -170,11 +110,81 @@ static void check_serial_cmd() {
     }
 }
 
-// Each board provides this. Must bring up the shared I2C bus (Wire.begin
-// with the board's SDA/SCL pins) and any board-private hardware that has
-// to settle before display/touch (e.g. an IO expander gating the LCD
-// reset line). Called exactly once at the start of setup().
-extern "C" void board_init(void);
+// ---- NTP sync (requires WiFi) ----
+static void sync_ntp(void) {
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+    time_t now = time(nullptr);
+    int attempts = 0;
+    while (now < 1700000000L && attempts < 20) {
+        delay(500);
+        now = time(nullptr);
+        attempts++;
+    }
+    if (now >= 1700000000L)
+        Serial.printf("[ntp] synced: %ld\n", (long)now);
+    else
+        Serial.println("[ntp] sync failed — reset times may be inaccurate");
+}
+
+// ---- Settings flow ----
+static void handle_settings_save(void) {
+    char ssid[65] = {}, pass[65] = {}, api_key[128] = {};
+    ui_settings_get_values(ssid, sizeof(ssid), pass, sizeof(pass),
+                           api_key, sizeof(api_key));
+
+    if (ssid[0] == '\0' || api_key[0] == '\0') {
+        ui_settings_set_status("SSID and API key are required.");
+        return;
+    }
+
+    settings_set_wifi(ssid, pass);
+    settings_set_api_key(api_key);
+    ui_settings_set_status("Connecting to WiFi...");
+
+    ui_update_wifi_status(WIFI_STATUS_CONNECTING, nullptr);
+    if (!wifi_hal_connect(ssid, pass, 20000)) {
+        ui_settings_set_status("WiFi connection failed. Check credentials.");
+        ui_update_wifi_status(WIFI_STATUS_ERROR, nullptr);
+        return;
+    }
+
+    ui_update_wifi_status(WIFI_STATUS_CONNECTED, wifi_hal_ip());
+    ui_settings_set_status("Connected! Syncing time...");
+    sync_ntp();
+
+    ui_settings_set_status("Fetching usage data...");
+    if (api_client_poll(&usage)) {
+        usage_rate_sample(usage.session_pct);
+        ui_update(&usage);
+        ui_settings_set_status("Done.");
+        delay(800);
+        ui_show_screen(SCREEN_USAGE);
+    } else {
+        ui_settings_set_status("API call failed. Check API key.");
+    }
+}
+
+// ---- API polling ----
+static uint32_t last_poll_ms = 0;
+#define POLL_INTERVAL_MS (60UL * 1000UL)
+
+static void maybe_poll(void) {
+    if (!wifi_hal_is_connected()) return;
+    uint32_t now = millis();
+    if (now - last_poll_ms < POLL_INTERVAL_MS) return;
+    last_poll_ms = now;
+
+    UsageData fresh = {};
+    if (api_client_poll(&fresh)) {
+        int g_before = usage_rate_group();
+        usage_rate_sample(fresh.session_pct);
+        int g_after = usage_rate_group();
+        usage = fresh;
+        ui_update(&usage);
+        if (g_after != g_before && splash_is_active())
+            splash_pick_for_current_rate();
+    }
+}
 
 void setup() {
     Serial.begin(115200);
@@ -182,16 +192,16 @@ void setup() {
     Serial.println("{\"ready\":true}");
 
     board_init();
+    settings_load();
 
     display_hal_init();
     display_hal_begin();
-    idle_init();   // takes over brightness (DISPLAY_DEFAULT_BRIGHTNESS) and starts the idle timer
-
+    idle_init();
     power_hal_init();
     imu_hal_init();
     touch_hal_init();
+    wifi_hal_init();
 
-    // ---- LVGL ----
     const int W = board_caps().width;
     const int H = board_caps().height;
 
@@ -212,41 +222,63 @@ void setup() {
     lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
     lv_indev_set_read_cb(indev, my_touch_cb);
 
-    ble_init();
     input_hal_init();
-
     ui_init();
-    ui_update_ble_status(ble_get_state(), ble_get_device_name(), ble_get_mac_address());
     ui_update_battery(power_hal_battery_pct(), power_hal_is_charging());
-    ui_show_screen(SCREEN_SPLASH);
 
-    Serial.printf("Dashboard ready (%s, %dx%d), waiting for data on BLE...\n",
-        board_caps().name, W, H);
+    if (settings_is_configured()) {
+        // Try to connect in background — show splash while connecting.
+        ui_show_screen(SCREEN_SPLASH);
+        ui_update_wifi_status(WIFI_STATUS_CONNECTING, nullptr);
+        lv_timer_handler();  // render one frame before blocking on WiFi
+
+        if (wifi_hal_connect(settings_wifi_ssid(), settings_wifi_pass(), 20000)) {
+            ui_update_wifi_status(WIFI_STATUS_CONNECTED, wifi_hal_ip());
+            sync_ntp();
+            if (api_client_poll(&usage)) {
+                usage_rate_sample(usage.session_pct);
+                ui_update(&usage);
+            }
+            last_poll_ms = millis();
+        } else {
+            ui_update_wifi_status(WIFI_STATUS_ERROR, nullptr);
+        }
+    } else {
+        // First boot — no credentials yet.
+        ui_show_screen(SCREEN_SETTINGS);
+    }
+
+    Serial.printf("Dashboard ready (%s, %dx%d)\n", board_caps().name, W, H);
 }
-
-static ble_state_t last_ble_state = BLE_STATE_INIT;
 
 void loop() {
     idle_tick();
     lv_timer_handler();
     ui_tick_anim();
-    ble_tick();
     power_hal_tick();
     imu_hal_tick();
     splash_tick();
-    // Rotation transition (blank + ramp) would fight the idle fade — skip
-    // ticks while the panel is dark. A rotation that happens during sleep
-    // is detected by the next tick after wake and ramped in then.
+    wifi_hal_tick();
+
     if (!idle_is_asleep()) display_hal_tick();
 
-    // ---- Physical buttons ----
-    //   PRIMARY   → HID Space  (Claude Code voice-mode PTT)
-    //   SECONDARY → HID Shift+Tab  (mode toggle; only if the board has one)
-    //   PWR       → cycle screens; on splash, cycle animations
-    // First press from sleep is consumed as a wake-only event by
-    // idle_consume_wake_press(); the normal action fires from the second
-    // press. Activity bookkeeping happens inside idle_consume_wake_press
-    // so no separate idle_note_activity() call is needed here.
+    // Settings save button
+    if (ui_settings_save_requested()) {
+        handle_settings_save();
+    }
+
+    // Poll API periodically
+    maybe_poll();
+
+    // PWR button — cycle screens
+    if (power_hal_pwr_pressed()) {
+        if (!idle_consume_wake_press()) {
+            if (ui_get_current_screen() == SCREEN_SPLASH) splash_next();
+            else                                          ui_cycle_screen();
+        }
+    }
+
+    // PRIMARY button (wake / HID placeholder)
     {
         static bool primary_was = false;
         static bool primary_wake_swallowed = false;
@@ -254,42 +286,11 @@ void loop() {
         if (primary_now != primary_was) {
             if (primary_now) {
                 if (idle_consume_wake_press()) primary_wake_swallowed = true;
-                else                            ble_keyboard_press(0x2C, 0);  // HID Space, no mods
             } else {
-                if (primary_wake_swallowed) primary_wake_swallowed = false;
-                else                        ble_keyboard_release();
+                primary_wake_swallowed = false;
             }
             primary_was = primary_now;
         }
-
-        if (board_caps().button_count >= 2) {
-            static bool secondary_was = false;
-            static bool secondary_wake_swallowed = false;
-            bool secondary_now = input_hal_is_held(INPUT_BTN_SECONDARY);
-            if (secondary_now != secondary_was) {
-                if (secondary_now) {
-                    if (idle_consume_wake_press()) secondary_wake_swallowed = true;
-                    else                            ble_keyboard_press(0x2B, 0x02);  // HID Tab + LEFT_SHIFT
-                } else {
-                    if (secondary_wake_swallowed) secondary_wake_swallowed = false;
-                    else                          ble_keyboard_release();
-                }
-                secondary_was = secondary_now;
-            }
-        }
-
-        if (power_hal_pwr_pressed()) {
-            if (!idle_consume_wake_press()) {
-                if (ui_get_current_screen() == SCREEN_SPLASH) splash_next();
-                else                                          ui_cycle_screen();
-            }
-        }
-    }
-
-    ble_state_t bs = ble_get_state();
-    if (bs != last_ble_state) {
-        last_ble_state = bs;
-        ui_update_ble_status(bs, ble_get_device_name(), ble_get_mac_address());
     }
 
     static int  last_pct      = -2;
@@ -303,23 +304,5 @@ void loop() {
     }
 
     check_serial_cmd();
-
-    if (ble_has_data()) {
-        if (parse_json(ble_get_data(), &usage)) {
-            int g_before = usage_rate_group();
-            usage_rate_sample(usage.session_pct);
-            int g_after = usage_rate_group();
-            if (g_after != g_before) {
-                Serial.printf("usage rate: group %d -> %d (s=%.2f%%)\n",
-                    g_before, g_after, usage.session_pct);
-                if (splash_is_active()) splash_pick_for_current_rate();
-            }
-            ui_update(&usage);
-            ble_send_ack();
-        } else {
-            ble_send_nack();
-        }
-    }
-
     delay(5);
 }
